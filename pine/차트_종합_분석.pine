@@ -1,0 +1,440 @@
+//@version=6
+indicator("차트 종합 분석", shorttitle="차트 분석", overlay=true, max_lines_count=100, max_boxes_count=100, max_labels_count=100, max_bars_back=5000)
+
+// 세 원본 지표의 가격선, FRAMA, 모멘텀/Insync, 매물대·피보나치 요소를 한 스크립트로 정리했습니다.
+// 종합 점수는 기술 신호 점수이며 보정된 수익 확률이나 매매 지시가 아닙니다.
+// 전체 구조 패턴 통계와 몬테카를로 시나리오는 Python 차트 분석 앱에서 제공합니다.
+
+string GROUP_SCORE = "종합 점수"
+string GROUP_PRICE = "가격선"
+string GROUP_PROFILE = "근사 매물대"
+string GROUP_PATTERN = "캔들 패턴"
+string GROUP_LEGACY = "기존 Long/Short 조건"
+
+int scoreThreshold = input.int(70, "강한 매수/매도 점수 기준", minval=55, maxval=95, group=GROUP_SCORE)
+bool showDashboard = input.bool(true, "종합 판단 표", group=GROUP_SCORE)
+bool showSignals = input.bool(true, "종합 매수/매도 위치 표시", group=GROUP_SCORE)
+bool showCandlePatterns = input.bool(true, "캔들 패턴 표시", group=GROUP_PATTERN)
+
+int framaLength = input.int(16, "FRAMA 길이", minval=4, maxval=60, step=2, group=GROUP_PRICE)
+float framaW = input.float(-4.6, "FRAMA W", step=0.1, group=GROUP_PRICE)
+int vwmaLength = input.int(200, "VWMA 밴드 길이", minval=10, group=GROUP_PRICE)
+float vwmaMult = input.float(3.0, "VWMA 밴드 배수", minval=0.1, maxval=10, step=0.1, group=GROUP_PRICE)
+int rollingFibLength = input.int(265, "고정 구간 피보나치 길이", minval=20, maxval=3000, group=GROUP_PRICE)
+int pivotLength = input.int(8, "스윙 피보나치 피벗 길이", minval=2, maxval=50, group=GROUP_PRICE)
+bool showFrama = input.bool(true, "FRAMA", group=GROUP_PRICE)
+bool showVwmaBands = input.bool(false, "VWMA 표준편차 밴드", group=GROUP_PRICE)
+bool showStarc = input.bool(false, "STARC 채널", group=GROUP_PRICE)
+bool showRollingFib = input.bool(false, "고정 구간 피보나치", group=GROUP_PRICE)
+bool showSwingFib = input.bool(true, "확정 스윙 피보나치", group=GROUP_PRICE)
+bool showMovingAverages = input.bool(true, "이동평균선", group=GROUP_PRICE)
+bool showLegacyMultiples = input.bool(false, "SMA 350 배수 밴드", group=GROUP_PRICE)
+bool showPivotLevels = input.bool(true, "최근 피벗 지지/저항", group=GROUP_PRICE)
+
+bool showProfile = input.bool(true, "근사 거래량 프로파일", group=GROUP_PROFILE)
+int profileLookback = input.int(160, "계산 봉 수", minval=30, maxval=500, group=GROUP_PROFILE)
+int profileBins = input.int(32, "가격 구간 수", minval=12, maxval=80, group=GROUP_PROFILE)
+float profileValueArea = input.float(0.70, "가치 영역 비율", minval=0.50, maxval=0.90, step=0.05, group=GROUP_PROFILE)
+int profileMaxWidth = input.int(12, "프로파일 최대 너비", minval=2, maxval=30, group=GROUP_PROFILE)
+
+int rsiLength = input.int(14, "RSI 길이", minval=2, group=GROUP_SCORE)
+int mfiLength = input.int(20, "MFI 길이", minval=2, group=GROUP_SCORE)
+int cciLength = input.int(14, "CCI 길이", minval=2, group=GROUP_SCORE)
+int rocLength = input.int(10, "ROC 길이", minval=2, group=GROUP_SCORE)
+int stochLength = input.int(14, "Stochastic 길이", minval=2, group=GROUP_SCORE)
+int dpoLength = input.int(18, "DPO 길이", minval=4, group=GROUP_SCORE)
+int aroonLength = input.int(14, "Aroon 길이", minval=2, group=GROUP_SCORE)
+int cvdLength = input.int(20, "CVD 추정 확인 봉 수", minval=2, maxval=200, group=GROUP_SCORE)
+
+int legacyFastLength = input.int(111, "기존 Long/Short 빠른 SMA", minval=2, group=GROUP_LEGACY)
+int legacySlowLength = input.int(350, "기존 Long/Short 느린 SMA", minval=2, group=GROUP_LEGACY)
+bool showLegacySignals = input.bool(false, "기존 Long/Short 교차 표시", group=GROUP_LEGACY)
+
+f_clamp(value, lowerBound, upperBound) =>
+    math.max(lowerBound, math.min(upperBound, value))
+
+f_frama(source, length, w) =>
+    int halfLength = math.max(2, int(math.floor(length / 2.0)))
+    float n3 = (ta.highest(high, length) - ta.lowest(low, length)) / length
+    float n2 = (ta.highest(high, halfLength) - ta.lowest(low, halfLength)) / halfLength
+    float olderHigh = ta.highest(high, halfLength)[halfLength]
+    float olderLow = ta.lowest(low, halfLength)[halfLength]
+    float n1 = not na(olderHigh) and not na(olderLow) ? (olderHigh - olderLow) / halfLength : na
+    float dimension = not na(n1) and n1 > 0 and n2 > 0 and n3 > 0 ? (math.log(n1 + n2) - math.log(n3)) / math.log(2.0) : 1.0
+    float alpha = math.exp(w * (dimension - 1.0))
+    float smoothing = f_clamp(alpha, 0.01, 1.0)
+    var float state = na
+    state := na(state[1]) ? source : source * smoothing + state[1] * (1.0 - smoothing)
+    state
+
+f_average(source, length, maType) =>
+    switch maType
+        "EMA" => ta.ema(source, length)
+        "WMA" => ta.wma(source, length)
+        "RMA" => ta.rma(source, length)
+        "VWMA" => ta.vwma(source, length)
+        => ta.sma(source, length)
+
+float trueRange = ta.tr(true)
+float atr = ta.atr(14)
+float safeAtr = math.max(nz(atr, syminfo.mintick), syminfo.mintick)
+
+// 1st indicator: FRAMA, VWMA deviation bands, STARC, rolling Fib, moving averages.
+float frama = f_frama(hl2, framaLength, framaW)
+float vwmaBasis = ta.vwma(hlc3, vwmaLength)
+float vwmaDeviation = vwmaMult * ta.stdev(hlc3, vwmaLength)
+float starcBasis = ta.sma(hl2, 6)
+float starcAtr = 2.0 * ta.sma(trueRange, framaLength)
+float starcUpper = starcBasis + starcAtr
+float starcLower = starcBasis - starcAtr
+
+float rollingHigh = ta.highest(close, rollingFibLength)
+float rollingLow = ta.lowest(close, rollingFibLength)
+float rollingRange = rollingHigh - rollingLow
+float rollingFib236 = rollingHigh - rollingRange * 0.236
+float rollingFib382 = rollingHigh - rollingRange * 0.382
+float rollingFib500 = rollingHigh - rollingRange * 0.500
+float rollingFib618 = rollingHigh - rollingRange * 0.618
+float rollingFib764 = rollingHigh - rollingRange * 0.764
+
+float ema20 = ta.ema(close, 20)
+float ema55 = ta.ema(close, 55)
+float sma111 = ta.sma(close, legacyFastLength)
+float sma200 = ta.sma(close, 200)
+float sma300 = ta.sma(close, 300)
+float sma350 = ta.sma(close, legacySlowLength)
+float legacyUpper16 = sma350 * 1.6
+float legacyUpper2 = sma350 * 2.0
+float legacyUpper3 = sma350 * 3.0
+float legacyUpper5 = sma350 * 5.0
+float legacyUpper8 = sma350 * 8.0
+float legacyLower14 = sma350 / 1.4
+float legacyLower16 = sma350 / 1.6
+float legacyLower2 = sma350 / 2.0
+float legacyLower25 = sma350 / 2.5
+
+// 3rd indicator: confirmed swing pivots and Fibonacci retracement levels.
+float confirmedPivotHigh = ta.pivothigh(high, pivotLength, pivotLength)
+float confirmedPivotLow = ta.pivotlow(low, pivotLength, pivotLength)
+var float lastPivotHigh = na
+var float lastPivotLow = na
+var int lastPivotHighBar = na
+var int lastPivotLowBar = na
+if not na(confirmedPivotHigh)
+    lastPivotHigh := confirmedPivotHigh
+    lastPivotHighBar := bar_index - pivotLength
+if not na(confirmedPivotLow)
+    lastPivotLow := confirmedPivotLow
+    lastPivotLowBar := bar_index - pivotLength
+
+bool swingUp = not na(lastPivotHighBar) and not na(lastPivotLowBar) and lastPivotHighBar > lastPivotLowBar
+bool swingDown = not na(lastPivotHighBar) and not na(lastPivotLowBar) and lastPivotLowBar > lastPivotHighBar
+float swingHigh = not na(lastPivotHigh) and not na(lastPivotLow) ? math.max(lastPivotHigh, lastPivotLow) : na
+float swingLow = not na(lastPivotHigh) and not na(lastPivotLow) ? math.min(lastPivotHigh, lastPivotLow) : na
+float swingRange = not na(swingHigh) and not na(swingLow) ? swingHigh - swingLow : na
+float swingFib236 = swingUp ? swingHigh - swingRange * 0.236 : swingDown ? swingLow + swingRange * 0.236 : na
+float swingFib382 = swingUp ? swingHigh - swingRange * 0.382 : swingDown ? swingLow + swingRange * 0.382 : na
+float swingFib500 = swingUp ? swingHigh - swingRange * 0.500 : swingDown ? swingLow + swingRange * 0.500 : na
+float swingFib618 = swingUp ? swingHigh - swingRange * 0.618 : swingDown ? swingLow + swingRange * 0.618 : na
+float swingFib786 = swingUp ? swingHigh - swingRange * 0.786 : swingDown ? swingLow + swingRange * 0.786 : na
+
+// 2nd indicator: Insync-style vote from Bollinger, CCI, EMO, MACD, MFI, DPO,
+// ROC, RSI, Stochastic, Aroon, and WaveTrend. Votes are normalized to 0–100.
+float rsiValue = ta.rsi(close, rsiLength)
+float mfiValue = ta.mfi(hlc3, mfiLength)
+float cciValue = ta.cci(hlc3, cciLength)
+float rocValue = ta.roc(close, rocLength)
+float stochRaw = ta.stoch(close, high, low, stochLength)
+float stochK = ta.sma(stochRaw, 1)
+float stochD = ta.sma(stochK, 3)
+float bbBasis = ta.sma(close, 20)
+float bbDev = 2.0 * ta.stdev(close, 20)
+float bbUpper = bbBasis + bbDev
+float bbLower = bbBasis - bbDev
+float bbPosition = bbUpper != bbLower ? (close - bbLower) / (bbUpper - bbLower) : 0.5
+
+float emoRaw = nz(volume, 0.0) > 0 ? 10000.0 * ta.change(hl2) * (high - low) / volume : 0.0
+float emo = ta.sma(emoRaw, 14)
+float emoAverage = ta.sma(emo, 10)
+[macdLine, macdSignal, macdHist] = ta.macd(close, 12, 26, 9)
+float macdHistAverage = ta.sma(macdHist, 10)
+int dpoOffset = int(math.floor(dpoLength / 2.0)) + 1
+float dpoValue = close - ta.sma(close, dpoLength)[dpoOffset]
+float dpoAverage = ta.sma(dpoValue, 10)
+float rocAverage = ta.sma(rocValue, 10)
+
+float aroonUp = 100.0 * (aroonLength + ta.highestbars(high, aroonLength + 1)) / aroonLength
+float aroonDown = 100.0 * (aroonLength + ta.lowestbars(low, aroonLength + 1)) / aroonLength
+float aroonOsc = aroonUp - aroonDown
+
+float wtSource = hlc3
+float wtEsa = ta.ema(wtSource, 10)
+float wtDeviation = ta.ema(math.abs(wtSource - wtEsa), 10)
+float wtCi = wtDeviation > 0 ? (wtSource - wtEsa) / (0.015 * wtDeviation) : 0.0
+float wt1 = ta.ema(wtCi, 21)
+float wt2 = ta.sma(wt1, 4)
+
+float voteBollinger = bbPosition < 0.05 ? -1.0 : bbPosition > 0.95 ? 1.0 : 0.0
+float voteCci = cciValue > 100 ? 1.0 : cciValue < -100 ? -1.0 : 0.0
+float voteEmo = emo > emoAverage and emoAverage > 0 ? 1.0 : emo < emoAverage and emoAverage < 0 ? -1.0 : 0.0
+float voteMacd = macdHist > macdHistAverage and macdHistAverage > 0 ? 1.0 : macdHist < macdHistAverage and macdHistAverage < 0 ? -1.0 : 0.0
+float voteMfi = mfiValue > 80 ? 1.0 : mfiValue < 20 ? -1.0 : 0.0
+float voteDpo = dpoValue > dpoAverage ? 1.0 : dpoValue < dpoAverage ? -1.0 : 0.0
+float voteRoc = rocValue > rocAverage ? 1.0 : rocValue < rocAverage ? -1.0 : 0.0
+float voteRsi = rsiValue > 70 ? 1.0 : rsiValue < 30 ? -1.0 : 0.0
+float voteStochK = stochK > 80 ? 1.0 : stochK < 20 ? -1.0 : 0.0
+float voteStochD = stochD > 80 ? 1.0 : stochD < 20 ? -1.0 : 0.0
+float voteAroon = aroonOsc > 0 ? 1.0 : aroonOsc < 0 ? -1.0 : 0.0
+float voteWaveTrend = wt1 > wt2 and wt1 > 0 ? 1.0 : wt1 < wt2 and wt1 < 0 ? -1.0 : 0.0
+float insyncBalance = voteBollinger + voteCci + voteEmo + voteMacd + voteMfi + voteDpo + voteRoc + voteRsi + voteStochK + voteStochD + voteAroon + voteWaveTrend
+float insyncIndex = f_clamp(50.0 + 50.0 * insyncBalance / 12.0, 0.0, 100.0)
+float insyncSignal = (insyncIndex - 50.0) / 50.0
+
+// Schaff-style cycle oscillator from the 2nd source, with guarded zero ranges.
+int stcLength = input.int(10, "STC 길이", minval=3, group=GROUP_SCORE)
+float stcMacd = ta.ema(close, 23) - ta.ema(close, 50)
+float stcLow1 = ta.lowest(stcMacd, stcLength)
+float stcRange1 = ta.highest(stcMacd, stcLength) - stcLow1
+float stcRaw1 = stcRange1 > 0 ? 100.0 * (stcMacd - stcLow1) / stcRange1 : 50.0
+var float stcSmooth1 = na
+stcSmooth1 := na(stcSmooth1[1]) ? stcRaw1 : stcSmooth1[1] + 0.5 * (stcRaw1 - stcSmooth1[1])
+float stcLow2 = ta.lowest(stcSmooth1, stcLength)
+float stcRange2 = ta.highest(stcSmooth1, stcLength) - stcLow2
+float stcRaw2 = stcRange2 > 0 ? 100.0 * (stcSmooth1 - stcLow2) / stcRange2 : 50.0
+var float stcValue = na
+stcValue := na(stcValue[1]) ? stcRaw2 : stcValue[1] + 0.5 * (stcRaw2 - stcValue[1])
+
+// Normalized moving-average oscillator and TMO-style comparison from source 2.
+string maMethod = input.string("EMA", "MacNorm 평균 방식", options=["EMA", "WMA", "RMA", "VWMA", "SMA"], group=GROUP_SCORE)
+int normFastLength = input.int(12, "MacNorm 빠른 길이", minval=2, group=GROUP_SCORE)
+int normSlowLength = input.int(21, "MacNorm 느린 길이", minval=3, group=GROUP_SCORE)
+int normWindow = input.int(50, "MacNorm 정규화 길이", minval=10, group=GROUP_SCORE)
+int tmoLength = input.int(14, "TMO 비교 길이", minval=3, maxval=100, group=GROUP_SCORE)
+float normFast = f_average(close, normFastLength, maMethod)
+float normSlow = f_average(close, normSlowLength, maMethod)
+float normSpread = math.max(math.max(math.abs(normFast), math.abs(normSlow)), syminfo.mintick)
+float normMacdRaw = f_clamp((normFast - normSlow) / normSpread, -1.0, 1.0)
+float normMacdLow = ta.lowest(normMacdRaw, normWindow)
+float normMacdHigh = ta.highest(normMacdRaw, normWindow)
+float normMacd = normMacdHigh != normMacdLow ? 2.0 * (normMacdRaw - normMacdLow) / (normMacdHigh - normMacdLow) - 1.0 : 0.0
+
+float tmoOsc = 0.0
+for i = 1 to tmoLength
+    tmoOsc += close > close[i] ? 1.0 : close < close[i] ? -1.0 : 0.0
+float tmoLine = ta.ema(ta.ema(100.0 * tmoOsc / tmoLength, 5), 3)
+
+// Confirmed pivot support/resistance updates after pivotLength bars.
+plot(showPivotLevels ? lastPivotHigh : na, "최근 피벗 저항", color=color.new(color.red, 20), linewidth=1, style=plot.style_stepline)
+plot(showPivotLevels ? lastPivotLow : na, "최근 피벗 지지", color=color.new(color.lime, 20), linewidth=1, style=plot.style_stepline)
+
+// Approximate rolling volume profile. Each candle's HLC3 volume is assigned to one price bin.
+var array<box> profileBoxes = array.new<box>()
+var array<line> profileLines = array.new<line>()
+var float profilePocPrice = na
+var float profileVahPrice = na
+var float profileValPrice = na
+float profileWindowHigh = ta.highest(high, profileLookback)
+float profileWindowLow = ta.lowest(low, profileLookback)
+if barstate.islast
+    while array.size(profileBoxes) > 0
+        box.delete(array.pop(profileBoxes))
+    while array.size(profileLines) > 0
+        line.delete(array.pop(profileLines))
+    profilePocPrice := na
+    profileVahPrice := na
+    profileValPrice := na
+    if showProfile and bar_index > 2
+        int effectiveLookback = math.min(profileLookback, bar_index + 1)
+        float profileHigh = profileWindowHigh
+        float profileLow = profileWindowLow
+        float priceRange = profileHigh - profileLow
+        if priceRange > syminfo.mintick
+            float binHeight = priceRange / profileBins
+            array<float> binVolumes = array.new<float>(profileBins, 0.0)
+            float totalProfileVolume = 0.0
+            for i = 0 to effectiveLookback - 1
+                float barVolume = nz(volume[i], 0.0)
+                int binIndex = int(math.floor((hlc3[i] - profileLow) / binHeight))
+                binIndex := math.max(0, math.min(profileBins - 1, binIndex))
+                array.set(binVolumes, binIndex, array.get(binVolumes, binIndex) + barVolume)
+                totalProfileVolume += barVolume
+            float maximumBinVolume = array.max(binVolumes)
+            int pocIndex = array.indexof(binVolumes, maximumBinVolume)
+            if totalProfileVolume > 0 and maximumBinVolume > 0 and pocIndex >= 0
+                int vahIndex = pocIndex
+                int valIndex = pocIndex
+                float valueAreaVolume = array.get(binVolumes, pocIndex)
+                float targetAreaVolume = totalProfileVolume * profileValueArea
+                while valueAreaVolume < targetAreaVolume and (valIndex > 0 or vahIndex < profileBins - 1)
+                    float belowVolume = valIndex > 0 ? array.get(binVolumes, valIndex - 1) : -1.0
+                    float aboveVolume = vahIndex < profileBins - 1 ? array.get(binVolumes, vahIndex + 1) : -1.0
+                    if aboveVolume > belowVolume
+                        vahIndex += 1
+                        valueAreaVolume += math.max(aboveVolume, 0.0)
+                    else
+                        valIndex -= 1
+                        valueAreaVolume += math.max(belowVolume, 0.0)
+                profilePocPrice := profileLow + (pocIndex + 0.5) * binHeight
+                profileVahPrice := profileLow + (vahIndex + 1.0) * binHeight
+                profileValPrice := profileLow + valIndex * binHeight
+                int profileStart = bar_index + 2
+                for i = 0 to profileBins - 1
+                    float binVolume = array.get(binVolumes, i)
+                    if binVolume > 0
+                        int boxWidth = math.max(1, int(math.round(profileMaxWidth * binVolume / maximumBinVolume)))
+                        color binColor = i >= valIndex and i <= vahIndex ? color.new(color.blue, 78) : color.new(color.gray, 84)
+                        box binBox = box.new(left=profileStart, top=profileLow + (i + 1.0) * binHeight, right=profileStart + boxWidth, bottom=profileLow + i * binHeight, xloc=xloc.bar_index, bgcolor=binColor, border_color=color.new(color.gray, 100))
+                        array.push(profileBoxes, binBox)
+                array.push(profileLines, line.new(math.max(0, bar_index - effectiveLookback), profilePocPrice, profileStart + profileMaxWidth, profilePocPrice, xloc=xloc.bar_index, extend=extend.right, color=color.yellow, width=2))
+                array.push(profileLines, line.new(math.max(0, bar_index - effectiveLookback), profileVahPrice, profileStart + profileMaxWidth, profileVahPrice, xloc=xloc.bar_index, extend=extend.right, color=color.new(color.aqua, 10), style=line.style_dashed))
+                array.push(profileLines, line.new(math.max(0, bar_index - effectiveLookback), profileValPrice, profileStart + profileMaxWidth, profileValPrice, xloc=xloc.bar_index, extend=extend.right, color=color.new(color.aqua, 10), style=line.style_dashed))
+
+// CVD is estimated from candle direction; it is not true bid/ask delta.
+float signedVolume = close > open ? nz(volume, 0.0) : close < open ? -nz(volume, 0.0) : 0.0
+float cvd = ta.cum(signedVolume)
+float cvdDelta = cvd - nz(cvd[cvdLength], cvd)
+float volumeAverage = ta.sma(nz(volume, 0.0), 20)
+float relativeVolume = volumeAverage > 0 ? nz(volume, 0.0) / volumeAverage : 0.0
+
+// Candle pattern rules. These are visual heuristics, not context-free predictions.
+float candleRange = math.max(high - low, syminfo.mintick)
+float candleBody = math.abs(close - open)
+float bodyRatio = candleBody / candleRange
+float upperWick = high - math.max(open, close)
+float lowerWick = math.min(open, close) - low
+bool doji = bodyRatio <= 0.10
+bool shootingStar = upperWick >= math.max(candleBody * 2.0, candleRange * 0.35) and lowerWick <= candleRange * 0.25 and bodyRatio <= 0.35
+bool hammer = lowerWick >= math.max(candleBody * 2.0, candleRange * 0.35) and upperWick <= candleRange * 0.25 and bodyRatio <= 0.35
+bool bullishEngulfing = close > open and close[1] < open[1] and open <= close[1] and close >= open[1]
+bool bearishEngulfing = close < open and close[1] > open[1] and open >= close[1] and close <= open[1]
+bool bullishCandlePattern = hammer or bullishEngulfing
+bool bearishCandlePattern = shootingStar or bearishEngulfing
+float patternSignal = bullishCandlePattern and not bearishCandlePattern ? 1.0 : bearishCandlePattern and not bullishCandlePattern ? -1.0 : 0.0
+
+// Transparent weighted directional score: trend, Insync momentum, location, volume/CVD, and candle pattern.
+float framaSignal = close > frama ? 1.0 : close < frama ? -1.0 : 0.0
+float emaTrendSignal = ema20 > ema55 ? 1.0 : ema20 < ema55 ? -1.0 : 0.0
+float longTermSignal = sma111 > sma350 ? 1.0 : sma111 < sma350 ? -1.0 : 0.0
+float slowSlopeSignal = sma200 > sma200[5] ? 1.0 : sma200 < sma200[5] ? -1.0 : 0.0
+float trendScore = (framaSignal + emaTrendSignal + longTermSignal + slowSlopeSignal) / 4.0
+float wtSignal = f_clamp(wt1 / 100.0, -1.0, 1.0)
+float stcSignal = f_clamp((stcValue - 50.0) / 50.0, -1.0, 1.0)
+float tmoSignal = f_clamp(tmoLine / 100.0, -1.0, 1.0)
+float momentumScore = (insyncSignal + wtSignal + stcSignal + tmoSignal) / 4.0
+float vwapLocation = f_clamp((close - vwmaBasis) / safeAtr, -1.0, 1.0)
+float fibMid = not na(swingFib500) ? swingFib500 : rollingFib500
+float fibLocation = not na(fibMid) ? f_clamp((close - fibMid) / safeAtr, -1.0, 1.0) : 0.0
+float profileLocation = not na(profilePocPrice) ? f_clamp((close - profilePocPrice) / safeAtr, -1.0, 1.0) : 0.0
+float locationScore = (vwapLocation + fibLocation + profileLocation) / (not na(profilePocPrice) ? 3.0 : 2.0)
+float volumeScore = nz(volume, 0.0) > 0 ? f_clamp((cvdDelta > 0 ? 1.0 : cvdDelta < 0 ? -1.0 : 0.0) * math.min(relativeVolume, 2.0) / 2.0, -1.0, 1.0) : 0.0
+float compositeRaw = 0.30 * trendScore + 0.30 * momentumScore + 0.20 * locationScore + 0.15 * volumeScore + 0.05 * patternSignal
+float buyScore = 50.0 + 50.0 * f_clamp(compositeRaw, -1.0, 1.0)
+float sellScore = 100.0 - buyScore
+bool buyTrigger = barstate.isconfirmed and ta.crossover(buyScore, scoreThreshold)
+bool sellTrigger = barstate.isconfirmed and ta.crossover(sellScore, scoreThreshold)
+bool currentBuyBias = buyScore >= scoreThreshold
+bool currentSellBias = sellScore >= scoreThreshold
+string assessment = currentBuyBias ? "매수 우위 · EXTREME" : currentSellBias ? "매도 우위 · EXTREME" : "중립"
+color assessmentColor = currentBuyBias ? color.new(color.lime, 5) : currentSellBias ? color.new(color.red, 5) : color.new(color.gray, 30)
+
+// Price overlays from the 1st indicator.
+plot(showFrama ? frama : na, "FRAMA", color=color.orange, linewidth=2)
+plot(showMovingAverages ? ema20 : na, "EMA 20", color=color.new(color.yellow, 0))
+plot(showMovingAverages ? ema55 : na, "EMA 55", color=color.new(color.orange, 0))
+plot(showMovingAverages ? sma200 : na, "SMA 200", color=color.new(color.aqua, 0), linewidth=2)
+plot(showMovingAverages ? sma300 : na, "SMA 300", color=color.new(color.blue, 0), linewidth=2)
+plot(showMovingAverages ? sma350 : na, "SMA 350", color=color.new(color.fuchsia, 0), linewidth=2)
+plot(showVwmaBands ? vwmaBasis : na, "VWMA basis", color=color.fuchsia, linewidth=2)
+plot(showVwmaBands ? vwmaBasis + vwmaDeviation * 0.236 : na, "VWMA +0.236σ", color=color.new(color.white, 30))
+plot(showVwmaBands ? vwmaBasis + vwmaDeviation * 0.382 : na, "VWMA +0.382σ", color=color.new(color.white, 35))
+plot(showVwmaBands ? vwmaBasis + vwmaDeviation * 0.500 : na, "VWMA +0.500σ", color=color.new(color.white, 40))
+plot(showVwmaBands ? vwmaBasis + vwmaDeviation * 0.618 : na, "VWMA +0.618σ", color=color.new(color.white, 45))
+plot(showVwmaBands ? vwmaBasis + vwmaDeviation * 0.764 : na, "VWMA +0.764σ", color=color.new(color.white, 50))
+plot(showVwmaBands ? vwmaBasis + vwmaDeviation : na, "VWMA +1.000σ", color=color.yellow, linewidth=2)
+plot(showVwmaBands ? vwmaBasis - vwmaDeviation * 0.236 : na, "VWMA -0.236σ", color=color.new(color.white, 30))
+plot(showVwmaBands ? vwmaBasis - vwmaDeviation * 0.382 : na, "VWMA -0.382σ", color=color.new(color.white, 35))
+plot(showVwmaBands ? vwmaBasis - vwmaDeviation * 0.500 : na, "VWMA -0.500σ", color=color.new(color.white, 40))
+plot(showVwmaBands ? vwmaBasis - vwmaDeviation * 0.618 : na, "VWMA -0.618σ", color=color.new(color.white, 45))
+plot(showVwmaBands ? vwmaBasis - vwmaDeviation * 0.764 : na, "VWMA -0.764σ", color=color.new(color.white, 50))
+plot(showVwmaBands ? vwmaBasis - vwmaDeviation : na, "VWMA -1.000σ", color=color.teal, linewidth=2)
+plot(showStarc ? starcBasis : na, "STARC median", color=color.new(color.navy, 0))
+plot(showStarc ? starcUpper : na, "STARC upper", color=color.new(color.red, 0), linewidth=2)
+plot(showStarc ? starcLower : na, "STARC lower", color=color.new(color.green, 0), linewidth=2)
+plot(showRollingFib ? rollingHigh : na, "Rolling Fib 1", color=color.new(color.black, 20))
+plot(showRollingFib ? rollingFib236 : na, "Rolling Fib 0.764", color=color.new(color.blue, 20))
+plot(showRollingFib ? rollingFib382 : na, "Rolling Fib 0.618", color=color.new(color.blue, 30))
+plot(showRollingFib ? rollingFib500 : na, "Rolling Fib 0.500", color=color.new(color.lime, 20))
+plot(showRollingFib ? rollingLow + rollingRange * 0.382 : na, "Rolling Fib 0.382", color=color.new(color.green, 20))
+plot(showRollingFib ? rollingLow + rollingRange * 0.236 : na, "Rolling Fib 0.236", color=color.new(color.red, 20))
+plot(showRollingFib ? rollingLow : na, "Rolling Fib 0", color=color.new(color.black, 20))
+plot(showSwingFib ? swingFib236 : na, "Swing Fib 0.236", color=color.new(color.purple, 40), style=plot.style_stepline)
+plot(showSwingFib ? swingFib382 : na, "Swing Fib 0.382", color=color.new(color.purple, 30), style=plot.style_stepline)
+plot(showSwingFib ? swingFib500 : na, "Swing Fib 0.500", color=color.new(color.purple, 20), style=plot.style_stepline)
+plot(showSwingFib ? swingFib618 : na, "Swing Fib 0.618", color=color.new(color.purple, 30), style=plot.style_stepline)
+plot(showSwingFib ? swingFib786 : na, "Swing Fib 0.786", color=color.new(color.purple, 40), style=plot.style_stepline)
+plot(showLegacyMultiples ? legacyUpper16 : na, "SMA 350 ×1.6", color=color.new(color.teal, 45))
+plot(showLegacyMultiples ? legacyUpper2 : na, "SMA 350 ×2", color=color.new(color.teal, 35))
+plot(showLegacyMultiples ? legacyUpper3 : na, "SMA 350 ×3", color=color.new(color.teal, 25))
+plot(showLegacyMultiples ? legacyUpper5 : na, "SMA 350 ×5", color=color.new(color.teal, 15))
+plot(showLegacyMultiples ? legacyUpper8 : na, "SMA 350 ×8", color=color.new(color.teal, 5))
+plot(showLegacyMultiples ? legacyLower14 : na, "SMA 350 ÷1.4", color=color.new(color.teal, 45))
+plot(showLegacyMultiples ? legacyLower16 : na, "SMA 350 ÷1.6", color=color.new(color.teal, 35))
+plot(showLegacyMultiples ? legacyLower2 : na, "SMA 350 ÷2", color=color.new(color.teal, 25))
+plot(showLegacyMultiples ? legacyLower25 : na, "SMA 350 ÷2.5", color=color.new(color.teal, 15))
+
+// Insync, CVD estimate, and POC remain available in the Data Window without distorting price scale.
+plot(insyncIndex, "Insync Index 0–100", color=color.aqua, display=display.data_window)
+plot(cvdDelta, "CVD 추정 변화", color=color.blue, display=display.data_window)
+plot(profilePocPrice, "근사 POC", color=color.yellow, display=display.data_window)
+plot(profileVahPrice, "근사 VAH", color=color.aqua, display=display.data_window)
+plot(profileValPrice, "근사 VAL", color=color.aqua, display=display.data_window)
+
+// Candle pattern markers.
+plotshape(showCandlePatterns and doji, "도지", shape.diamond, location.abovebar, color=color.gray, text="도지", textcolor=color.white, size=size.tiny)
+plotshape(showCandlePatterns and shootingStar, "슈팅스타", shape.triangledown, location.abovebar, color=color.red, text="슈팅스타", textcolor=color.white, size=size.tiny)
+plotshape(showCandlePatterns and hammer, "망치형", shape.triangleup, location.belowbar, color=color.teal, text="망치", textcolor=color.white, size=size.tiny)
+plotshape(showCandlePatterns and bullishEngulfing, "상승 장악형", shape.labelup, location.belowbar, color=color.new(color.green, 10), text="상승 장악", textcolor=color.white, size=size.tiny)
+plotshape(showCandlePatterns and bearishEngulfing, "하락 장악형", shape.labeldown, location.abovebar, color=color.new(color.red, 10), text="하락 장악", textcolor=color.white, size=size.tiny)
+
+// Legacy MACD-after-RSI-extreme and SMA 111/350 ratio cross signals.
+bool wasOversold = ta.lowest(rsiValue, 6) <= 29
+bool wasOverbought = ta.highest(rsiValue, 6) >= 71
+bool macdBull = ta.crossover(macdLine, macdSignal) and wasOversold
+bool macdBear = ta.crossunder(macdLine, macdSignal) and wasOverbought
+bool legacyLong = ta.crossunder(sma111, legacyLower14)
+bool legacyShort = ta.crossover(sma111, legacyUpper2)
+plotshape(showLegacySignals and macdBull, "MACD 과매도 반전", shape.triangleup, location.belowbar, color=color.lime, text="MACD", textcolor=color.black, size=size.tiny)
+plotshape(showLegacySignals and macdBear, "MACD 과매수 반전", shape.triangledown, location.abovebar, color=color.orange, text="MACD", textcolor=color.black, size=size.tiny)
+plotshape(showLegacySignals and legacyLong, "기존 LONG", shape.triangleup, location.belowbar, color=color.green, text="LONG", textcolor=color.white, size=size.small)
+plotshape(showLegacySignals and legacyShort, "기존 SHORT", shape.triangledown, location.abovebar, color=color.red, text="SHORT", textcolor=color.white, size=size.small)
+
+// A large label marks the current chart location when the threshold is active.
+plotshape(showSignals and barstate.islast and currentBuyBias, "현재 매수 우위", shape.labelup, location.belowbar, color=color.lime, text="매수 우위\nEXTREME", textcolor=color.black, size=size.normal)
+plotshape(showSignals and barstate.islast and currentSellBias, "현재 매도 우위", shape.labeldown, location.abovebar, color=color.red, text="매도 우위\nEXTREME", textcolor=color.white, size=size.normal)
+plotshape(showSignals and buyTrigger and not barstate.islast, "매수 점수 기준 돌파", shape.triangleup, location.belowbar, color=color.lime, text="BUY", textcolor=color.black, size=size.tiny)
+plotshape(showSignals and sellTrigger and not barstate.islast, "매도 점수 기준 돌파", shape.triangledown, location.abovebar, color=color.red, text="SELL", textcolor=color.white, size=size.tiny)
+
+// Dashboard: these are directional scores, not probabilities.
+var table dashboard = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black, 12), frame_color=color.gray, frame_width=1, border_color=color.new(color.gray, 65), border_width=1)
+if barstate.islast and showDashboard
+    table.cell(dashboard, 0, 0, "차트 종합 분석", text_color=color.white, bgcolor=color.new(color.blue, 35))
+    table.cell(dashboard, 1, 0, assessment, text_color=color.white, bgcolor=assessmentColor)
+    table.cell(dashboard, 0, 1, "매수 점수", text_color=color.white)
+    table.cell(dashboard, 1, 1, str.tostring(math.round(buyScore)) + " / 100", text_color=color.lime)
+    table.cell(dashboard, 0, 2, "매도 점수", text_color=color.white)
+    table.cell(dashboard, 1, 2, str.tostring(math.round(sellScore)) + " / 100", text_color=color.red)
+    table.cell(dashboard, 0, 3, "Insync", text_color=color.white)
+    table.cell(dashboard, 1, 3, str.tostring(math.round(insyncIndex)) + " / 100", text_color=color.aqua)
+    table.cell(dashboard, 0, 4, "CVD 추정", text_color=color.white)
+    table.cell(dashboard, 1, 4, cvdDelta > 0 ? "매수 방향 거래량 우세" : cvdDelta < 0 ? "매도 방향 거래량 우세" : "중립", text_color=cvdDelta >= 0 ? color.lime : color.red)
+    table.cell(dashboard, 0, 5, "상대 거래량", text_color=color.white)
+    table.cell(dashboard, 1, 5, str.tostring(relativeVolume, "#.##") + "× 평균", text_color=relativeVolume >= 1.5 ? color.yellow : color.white)
+    table.cell(dashboard, 0, 6, "확률 아님", text_color=color.silver)
+    table.cell(dashboard, 1, 6, "신호 점수 · 참고용", text_color=color.silver)
+if barstate.islast and not showDashboard
+    table.clear(dashboard, 0, 0, 1, 6)
+
+alertcondition(buyTrigger, "차트 종합 매수 점수", "차트 종합 매수 점수가 설정 기준을 상향 돌파했습니다.")
+alertcondition(sellTrigger, "차트 종합 매도 점수", "차트 종합 매도 점수가 설정 기준을 상향 돌파했습니다.")
+alertcondition(macdBull and barstate.isconfirmed, "MACD 과매도 반전", "RSI 과매도 구간 뒤 MACD가 상승 교차했습니다.")
+alertcondition(macdBear and barstate.isconfirmed, "MACD 과매수 반전", "RSI 과매수 구간 뒤 MACD가 하락 교차했습니다.")
