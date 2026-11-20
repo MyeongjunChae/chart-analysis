@@ -11,7 +11,7 @@ from plotly.subplots import make_subplots
 
 st.set_page_config(page_title="차트 분석", page_icon="📈", layout="wide")
 st.title("📈 차트 분석")
-st.caption("OHLCV CSV 차트 · 캔들/차트 패턴 · 과거 빈도 · 몬테카를로 시나리오")
+st.caption("OHLCV CSV 차트 · 종합 방향 점수 · 캔들/차트 패턴 · CVD 추정 · 몬테카를로 시나리오")
 
 PATTERN_META = {
     "doji": ("도지", 0, "diamond", "#b0bec5"),
@@ -64,11 +64,13 @@ def normalize_ohlcv(raw: pd.DataFrame, columns: dict[str, str | None]) -> pd.Dat
     data["volume"] = pd.to_numeric(raw[volume_column], errors="coerce").fillna(0) if volume_column else 0.0
 
     data = data.dropna(subset=["time", *required]).copy()
-    data = data[(data["open"] > 0) & (data["high"] > 0) & (data["low"] > 0) & (data["close"] > 0)]
+    prices_finite = np.isfinite(data[["open", "high", "low", "close"]]).all(axis=1)
+    data = data[prices_finite & (data["open"] > 0) & (data["high"] > 0) & (data["low"] > 0) & (data["close"] > 0)]
     invalid_range = (
         (data["high"] < data[["open", "close", "low"]].max(axis=1))
         | (data["low"] > data[["open", "close", "high"]].min(axis=1))
         | (data["volume"] < 0)
+        | ~np.isfinite(data["volume"])
     )
     data = data.loc[~invalid_range].sort_values("time").drop_duplicates("time", keep="last").reset_index(drop=True)
     if len(data) < 40:
@@ -257,6 +259,138 @@ def fib_levels(data: pd.DataFrame) -> dict[str, float] | None:
     return {f"Fib {r:.3f}": low + (high - low) * r for r in ratios}
 
 
+def approximate_cvd(data: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Estimate signed volume from candle direction; this is not bid/ask delta."""
+    direction = np.sign(data["close"].to_numpy() - data["open"].to_numpy())
+    signed_volume = pd.Series(direction * data["volume"].to_numpy(), index=data.index)
+    cvd = signed_volume.cumsum()
+    average_volume = data["volume"].rolling(20, min_periods=1).mean()
+    relative_volume = data["volume"] / average_volume.replace(0, np.nan)
+    return cvd, signed_volume, relative_volume.fillna(0.0)
+
+
+def composite_assessment(
+    data: pd.DataFrame,
+    signals: pd.DataFrame,
+    profile: dict[str, float] | None,
+    fibs: dict[str, float] | None,
+) -> dict[str, Any]:
+    """Build a directional score from normalized groups, not a win probability."""
+    close, high, low = data["close"], data["high"], data["low"]
+    latest = float(close.iloc[-1])
+    ema_fast = close.ewm(span=20, min_periods=20, adjust=False).mean()
+    ema_slow = close.ewm(span=50, min_periods=50, adjust=False).mean()
+    sma_long = close.rolling(200, min_periods=200).mean()
+    true_range = pd.concat(
+        [high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1
+    ).max(axis=1)
+    atr = float(true_range.rolling(14, min_periods=1).mean().iloc[-1])
+    atr = max(atr, latest * 1e-8, 1e-12)
+
+    def sign(value: float) -> float:
+        return float(np.sign(value)) if np.isfinite(value) else 0.0
+
+    def clamp(value: float) -> float:
+        return float(np.clip(value, -1.0, 1.0)) if np.isfinite(value) else 0.0
+
+    trend_parts = [sign(float(ema_fast.iloc[-1] - ema_slow.iloc[-1]))]
+    if pd.notna(sma_long.iloc[-1]):
+        trend_parts.append(sign(latest - float(sma_long.iloc[-1])))
+        trend_parts.append(sign(float(sma_long.iloc[-1] - sma_long.iloc[-11])))
+    else:
+        trend_parts.append(sign(float(ema_slow.iloc[-1] - ema_slow.iloc[-11])))
+    trend_score = float(np.mean(trend_parts))
+
+    change = close.diff()
+    avg_gain = change.clip(lower=0).ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+    avg_loss = (-change.clip(upper=0)).ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+    relative_strength = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - 100 / (1 + relative_strength)
+    rsi = rsi.mask((avg_loss == 0) & (avg_gain > 0), 100).fillna(50)
+    macd = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
+    macd_signal = macd.ewm(span=9, adjust=False).mean()
+    macd_hist = float((macd - macd_signal).iloc[-1])
+    roc = float((latest / float(close.iloc[-11]) - 1) * 100) if len(close) > 10 else 0.0
+    momentum_score = float(np.mean([
+        clamp((float(rsi.iloc[-1]) - 50) / 25),
+        clamp(macd_hist / max(atr * 0.25, 1e-12)),
+        clamp(roc / 5),
+    ]))
+
+    typical = (high + low + close) / 3
+    cumulative_volume = data["volume"].cumsum()
+    anchored_vwap = float((typical * data["volume"]).sum() / cumulative_volume.iloc[-1]) if cumulative_volume.iloc[-1] > 0 else latest
+    location_parts = [clamp((latest - anchored_vwap) / (atr * 2))]
+    if profile:
+        if latest > profile["VAH"]:
+            profile_score = 1.0
+        elif latest < profile["VAL"]:
+            profile_score = -1.0
+        else:
+            profile_score = clamp((latest - profile["POC"]) / (atr * 2))
+        location_parts.append(profile_score)
+    if fibs and "Fib 0.500" in fibs:
+        location_parts.append(clamp((latest - fibs["Fib 0.500"]) / (atr * 2)))
+    location_score = float(np.mean(location_parts))
+
+    cvd, signed_volume, relative_volume = approximate_cvd(data)
+    recent_volume = float(data["volume"].tail(20).sum())
+    cvd_ratio = float(signed_volume.tail(20).sum() / recent_volume) if recent_volume > 0 else 0.0
+    candle_confirmation = sign(float(data["close"].iloc[-1] - data["open"].iloc[-1])) * min(
+        float(relative_volume.iloc[-1]) / 2, 1.0
+    )
+    volume_score = clamp(0.75 * cvd_ratio + 0.25 * candle_confirmation)
+
+    recent_events: list[tuple[float, int]] = []
+    for idx in range(max(0, len(data) - 5), len(data)):
+        age_weight = float(5 - (len(data) - 1 - idx))
+        for key, (_, direction, _, _) in PATTERN_META.items():
+            if direction and bool(signals.at[idx, key]):
+                recent_events.append((age_weight, direction))
+    structure_score = (
+        float(sum(weight * direction for weight, direction in recent_events) / sum(weight for weight, _ in recent_events))
+        if recent_events else 0.0
+    )
+
+    components = {
+        "추세": trend_score,
+        "모멘텀": momentum_score,
+        "가격 위치": location_score,
+        "거래량/CVD 추정": volume_score,
+        "최근 패턴": structure_score,
+    }
+    weights = {"추세": 0.25, "모멘텀": 0.25, "가격 위치": 0.20, "거래량/CVD 추정": 0.20, "최근 패턴": 0.10}
+    score = clamp(sum(components[name] * weight for name, weight in weights.items()))
+    buy_score = 50 + score * 50
+    sell_score = 100 - buy_score
+    bullish_agreement = sum(value > 0 for value in components.values())
+    bearish_agreement = sum(value < 0 for value in components.values())
+    if buy_score >= 70 and bullish_agreement >= 3:
+        direction, strength = "매수 우세", "Extreme" if buy_score >= 80 and bullish_agreement >= 4 else "Strong"
+    elif sell_score >= 70 and bearish_agreement >= 3:
+        direction, strength = "매도 우세", "Extreme" if sell_score >= 80 and bearish_agreement >= 4 else "Strong"
+    elif buy_score > 55:
+        direction, strength = "상승 쪽", "Moderate"
+    elif sell_score > 55:
+        direction, strength = "하락 쪽", "Moderate"
+    else:
+        direction, strength = "중립", "대기"
+
+    return {
+        "direction": direction,
+        "strength": strength,
+        "buy_score": buy_score,
+        "sell_score": sell_score,
+        "bullish_agreement": bullish_agreement,
+        "bearish_agreement": bearish_agreement,
+        "components": components,
+        "cvd": cvd,
+        "cvd_ratio": cvd_ratio,
+        "relative_volume": float(relative_volume.iloc[-1]),
+        "rsi": float(rsi.iloc[-1]),
+    }
+
+
 def wilson_interval(successes: int, total: int, z: float = 1.96) -> tuple[float, float]:
     if total <= 0:
         return np.nan, np.nan
@@ -279,7 +413,7 @@ def pattern_statistics(data: pd.DataFrame, signals: pd.DataFrame, horizon: int) 
             if direction == 0:
                 wins, title = int(np.sum(future_returns > 0)), "상승 빈도"
             else:
-                wins, title = int(np.sum(future_returns * direction > 0), "방향 적중률")
+                wins, title = int(np.sum(future_returns * direction > 0)), "방향 적중률"
             n = int(len(future_returns))
             rate = wins / n
             lower, upper = wilson_interval(wins, n)
@@ -304,17 +438,19 @@ def simulate_paths(data: pd.DataFrame, horizon: int, path_count: int, seed: int)
 
 
 def make_price_chart(data: pd.DataFrame, signals: pd.DataFrame, profile: dict[str, float] | None,
-                     fibs: dict[str, float] | None, visible_bars: int) -> go.Figure:
+                     fibs: dict[str, float] | None, cvd: pd.Series, visible_bars: int) -> go.Figure:
     view = data.tail(visible_bars)
     flags = signals.loc[view.index]
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.04,
-                        row_heights=[0.78, 0.22], specs=[[{}], [{}]])
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.035,
+                        row_heights=[0.66, 0.17, 0.17], specs=[[{}], [{}], [{}]])
     fig.add_trace(go.Candlestick(x=view["time"], open=view["open"], high=view["high"],
                                  low=view["low"], close=view["close"], name="가격",
                                  increasing_line_color="#26a69a", decreasing_line_color="#ef5350"), row=1, col=1)
     fig.add_trace(go.Bar(x=view["time"], y=view["volume"],
                          marker_color=np.where(view["close"] >= view["open"], "#26a69a", "#ef5350"),
                          name="거래량", opacity=0.65), row=2, col=1)
+    fig.add_trace(go.Scatter(x=view["time"], y=cvd.loc[view.index], mode="lines",
+                             line={"color": "#42a5f5", "width": 1.5}, name="CVD 추정"), row=3, col=1)
 
     for key, (label, direction, symbol, color) in PATTERN_META.items():
         hit = flags[key]
@@ -338,11 +474,12 @@ def make_price_chart(data: pd.DataFrame, signals: pd.DataFrame, profile: dict[st
             fig.add_hline(y=price, line_dash="dash", line_color="rgba(171, 71, 188, 0.45)",
                           annotation_text=f"{name} {price:,.6g}", annotation_position="left", row=1, col=1)
 
-    fig.update_layout(height=760, template="plotly_dark", paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
+    fig.update_layout(height=900, template="plotly_dark", paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
                       margin={"l": 20, "r": 20, "t": 35, "b": 10}, legend={"orientation": "h", "y": 1.02},
                       xaxis_rangeslider_visible=False, hovermode="x unified")
     fig.update_yaxes(title_text="가격", row=1, col=1, side="right")
     fig.update_yaxes(title_text="거래량", row=2, col=1, side="right")
+    fig.update_yaxes(title_text="CVD 추정", row=3, col=1, side="right")
     fig.update_xaxes(showgrid=True, gridcolor="rgba(255,255,255,0.08)")
     return fig
 
@@ -429,6 +566,7 @@ except Exception as exc:
 signals = detect_patterns(df)
 profile = profile_levels(df, bins=profile_bins)
 fibs = fib_levels(df)
+assessment = composite_assessment(df, signals, profile, fibs)
 stats = pattern_statistics(df, signals, int(horizon))
 latest = df.iloc[-1]
 current_price = float(latest["close"])
@@ -441,8 +579,25 @@ m2.metric("최근 봉 변동", f"{change_1:+.2f}%")
 m3.metric("데이터 행", f"{len(df):,}")
 m4.metric("기간", f"{df['time'].iloc[0]} — {df['time'].iloc[-1]}")
 
+st.subheader("종합 방향 점수")
+score_cols = st.columns(4)
+score_cols[0].metric("현재 판단", f"{assessment['direction']} · {assessment['strength']}")
+score_cols[1].metric("상승 방향 점수", f"{assessment['buy_score']:.0f}/100")
+score_cols[2].metric("하락 방향 점수", f"{assessment['sell_score']:.0f}/100")
+score_cols[3].metric("방향 합의", f"상승 {assessment['bullish_agreement']}/5 · 하락 {assessment['bearish_agreement']}/5")
+component_rows = [
+    {"요소": name, "점수": round(value * 100), "방향": "상승" if value > 0 else "하락" if value < 0 else "중립"}
+    for name, value in assessment["components"].items()
+]
+st.dataframe(pd.DataFrame(component_rows), hide_index=True, use_container_width=True)
+st.caption(
+    f"상승/하락 방향 점수는 승률이 아닙니다. 최근 20봉 CVD 추정 비율 {assessment['cvd_ratio'] * 100:+.1f}% · "
+    f"상대 거래량 {assessment['relative_volume']:.2f}x · RSI {assessment['rsi']:.1f}. "
+    "CVD는 봉의 종가와 시가 방향으로 거래량을 나눈 근사값입니다."
+)
+
 st.subheader("가격 차트와 자동 패턴")
-st.plotly_chart(make_price_chart(df, signals, profile, fibs, int(visible_bars)), use_container_width=True)
+st.plotly_chart(make_price_chart(df, signals, profile, fibs, assessment["cvd"], int(visible_bars)), use_container_width=True)
 
 event_rows: list[dict[str, Any]] = []
 for key, (label, direction, _, _) in PATTERN_META.items():
@@ -502,6 +657,8 @@ with st.expander("패턴 규칙과 해석 한계"):
         - 확률은 업로드 데이터 안에서 같은 규칙이 발생한 과거 사례의 방향 빈도입니다. 표본 수와 95% Wilson 구간을 함께 확인하세요. 적은 표본은 불안정합니다.
         - 몬테카를로는 최근 로그수익률을 복원추출하는 시나리오입니다. 미래 가격이나 수익을 보장하지 않으며, 거래 비용·슬리피지·유동성·시장 구조 변화는 반영하지 않습니다.
         - 매물대는 봉의 대표가격(HLC3)에 거래량을 배분한 근사 POC/VAH/VAL입니다. 실제 체결별 매수·매도 흐름은 아닙니다.
+        - 종합 방향 점수와 매수/매도 점수는 기술 신호를 정규화해 합산한 점수입니다. 보정된 예측 확률이나 투자 지시가 아닙니다.
+        - CVD는 봉 방향으로 거래량에 부호를 붙여 누적한 근사값입니다. 실제 체결 단위 매수/매도 델타와 다릅니다.
         """
     )
 with st.expander("현재 업로드 데이터"):
