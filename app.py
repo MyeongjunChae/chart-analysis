@@ -9,8 +9,8 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 
-st.set_page_config(page_title="Market Pattern Lab", page_icon="📈", layout="wide")
-st.title("📈 Market Pattern Lab")
+st.set_page_config(page_title="차트 분석", page_icon="📈", layout="wide")
+st.title("📈 차트 분석")
 st.caption("OHLCV CSV 차트 · 캔들/차트 패턴 · 과거 빈도 · 몬테카를로 시나리오")
 
 PATTERN_META = {
